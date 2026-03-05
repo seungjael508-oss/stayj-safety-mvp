@@ -1,0 +1,93 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+
+    function patientDoc(patientId) {
+      return get(/databases/$(database)/documents/patients/$(patientId));
+    }
+    function patientData(patientId) {
+      return patientDoc(patientId).data;
+    }
+    function patientExists(patientId) {
+      return patientData(patientId) != null;
+    }
+    function caregiverOf(patientId) {
+      return patientData(patientId).caregiverId;
+    }
+    function isCaregiverOf(patientId) {
+      return patientExists(patientId) && request.auth.uid == caregiverOf(patientId);
+    }
+
+    // ─── patients ────────────────────────────────────────
+    match /patients/{patientId} {
+      allow read: if isSignedIn() &&
+        (request.auth.uid == patientId || isCaregiverOf(patientId));
+
+      // patient는 location만 업데이트 가능
+      allow update: if isSignedIn() &&
+        request.auth.uid == patientId &&
+        request.resource.data.diff(resource.data)
+          .affectedKeys().hasOnly(['location']);
+
+      allow create, delete: if false;
+    }
+
+    // ─── caregivers ───────────────────────────────────────
+    match /caregivers/{caregiverId} {
+      allow read: if isSignedIn() && request.auth.uid == caregiverId;
+
+      // caregiver는 fcmToken, outingMode만 업데이트 가능
+      allow update: if isSignedIn() &&
+        request.auth.uid == caregiverId &&
+        request.resource.data.diff(resource.data)
+          .affectedKeys().hasOnly(['fcmToken', 'outingMode']);
+
+      allow create, delete: if false;
+    }
+
+    // ─── escapeEvents ─────────────────────────────────────
+    match /escapeEvents/{eventId} {
+      allow create: if isSignedIn() &&
+        request.resource.data.patientId == request.auth.uid &&
+        request.resource.data.type in ['geofence', 'sos'] &&
+        request.resource.data.keys().hasOnly([
+          'patientId', 'type', 'lat', 'lng', 'distance',
+          'accuracy', 'geofenceRadius', 'detectedAt', 'confirmed'
+        ]) &&
+        request.resource.data.confirmed == false &&
+
+        // 최소 타입/범위 검증 (운영 안정성)
+        request.resource.data.lat is number &&
+        request.resource.data.lng is number &&
+        request.resource.data.lat >= -90 && request.resource.data.lat <= 90 &&
+        request.resource.data.lng >= -180 && request.resource.data.lng <= 180 &&
+        request.resource.data.distance is number && request.resource.data.distance >= 0;
+
+      allow read: if isSignedIn() &&
+        patientExists(resource.data.patientId) &&
+        (request.auth.uid == resource.data.patientId ||
+         request.auth.uid == caregiverOf(resource.data.patientId));
+
+      allow update, delete: if false;
+    }
+
+    // ─── alerts ───────────────────────────────────────────
+    match /alerts/{alertId} {
+      allow read: if isSignedIn() &&
+        patientExists(resource.data.patientId) &&
+        (request.auth.uid == resource.data.patientId ||
+         request.auth.uid == caregiverOf(resource.data.patientId));
+      allow write: if false;
+    }
+
+    // ─── Cloud Functions only ─────────────────────────────
+    match /scheduledAlerts/{id} { allow read, write: if false; }
+    match /dispatchLogs/{id}    { allow read, write: if false; }
+    match /callRecords/{id}     { allow read, write: if false; }
+    match /dedupeLocks/{id}     { allow read, write: if false; }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}
